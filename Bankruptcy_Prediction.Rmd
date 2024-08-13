@@ -1,0 +1,281 @@
+
+
+```{r}
+library(readr)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(randomForest)
+library(glmnet)
+library(caret)
+library(mltools)
+library(ROSE)
+library(smotefamily)
+library(pROC)
+```
+```{r}
+bankdata <- read_csv("data.csv")
+```
+```{r}
+print("Original column names:")
+print(colnames(bankdata))
+
+colnames(bankdata) <- make.names(colnames(bankdata))
+
+
+print("Cleaned column names:")
+print(colnames(bankdata))
+
+```
+
+```{r}
+#NA Checker: no missing values
+na_count <- sapply(bankdata, function(x) sum(is.na(x)))
+
+na_count_df <- data.frame(
+  Variable = names(na_count),
+  NA_Count = na_count
+)
+
+print(na_count_df)
+```
+```{r}
+#EDA for Bankruptcy
+(
+  sum(bankdata$'Bankrupt.')
+)
+#220 Bankruptcies
+#220/6819 = 3.22%
+```
+
+
+```{r}
+#Variable Selection Methods: LASSO, Ridge, Elastic Net
+#First: LASSO
+bankdata_nobr <- bankdata %>% select(-`Bankrupt.`)
+x <- as.matrix(bankdata_nobr)
+y <- bankdata$'Bankrupt.'
+
+```
+
+```{r}
+lasso_model <- cv.glmnet(x, y, family = "binomial", alpha = 1)
+opt_lambda <- lasso_model$lambda.min
+
+final_lasso_model <- glmnet(x,y, family = "binomial", alpha = 1, lambda = opt_lambda)
+
+coef(lasso_model)
+
+```
+
+```{r}
+#Second: Ridge
+ridge_model <- cv.glmnet(x, y, family = "binomial", alpha = 0)
+opt_lambda <- ridge_model$lambda.min
+
+final_ridge_model <- glmnet(x,y, family = "binomial", alpha = 0, lambda = opt_lambda)
+
+coef(ridge_model)
+coef(final_ridge_model)
+```
+
+```{r}
+#Third: Elastic Net
+elastic_model <- cv.glmnet(x, y, family = "binomial", alpha = 0.5)
+opt_lambda <- elastic_model$lambda.min
+
+final_elastic_model <- glmnet(x,y, family = "binomial", alpha = 0.5, lambda = opt_lambda)
+
+coef(final_elastic_model)
+```
+
+```{r}
+#Creating formula with selected covariates to fit into future models
+coefs <- coef(final_elastic_model)
+coefs_df <- as.data.frame(as.matrix(coefs))
+
+
+non_zero_coefs <- coefs_df[coefs_df != 0, , drop = FALSE]
+non_zero_vars <- rownames(non_zero_coefs)[-1] 
+
+
+formula_string <- paste("Bankrupt. ~", paste(non_zero_vars, collapse = " + "))
+
+formula <- as.formula(formula_string)
+
+
+
+```
+
+```{r}
+train_index <- createDataPartition(bankdata$Bankrupt., p = 0.6, list = FALSE)
+
+data_train <- bankdata[train_index, ]
+data_test <- bankdata[-train_index, ]
+```
+
+
+```{r}
+#Dealing with Minority: 220 non bankrupt, 220 bankrupt
+#Undersampling
+
+br <- data_train %>% filter(Bankrupt. == 1)
+nobr <- data_train %>% filter(Bankrupt. == 0)
+
+brupt_count <- nrow(br)
+nobrupt_count <- nrow(nobr)
+
+
+set.seed(1287) 
+nobr_sample <- nobr %>% sample_n(220)
+
+
+balanced_df <- bind_rows(br, nobr_sample)
+
+balanced_df <- balanced_df %>% sample_frac(1)
+
+```
+
+
+```{r}
+#Oversampling with duplicating minority class
+br$Bankrupt. <- as.factor(br$Bankrupt.)
+dupe_br <- br[rep(1:nrow(br), times = 30), ]
+duped_data <- bind_rows(data_train, dupe_br)
+data_train$Bankrupt. <- as.factor(data_train$Bankrupt.)
+```
+
+```{r}
+#Oversampling by random sampling minority 
+
+
+n_needed <- nrow(data_train %>% filter(Bankrupt. == 0))
+
+
+sampled_minority_class <- br[sample(nrow(br), size = n_needed, replace = TRUE), ]
+
+oversampled_data <- bind_rows(data_train %>% filter(Bankrupt. == 0), sampled_minority_class)
+
+
+
+summary(oversampled_data$Bankrupt.)
+```
+
+
+```{r}
+#Oversampling with SMOTE
+#data_train$Bankrupt. <- as.numeric(data_train$Bankrupt.)
+#data_train$Bankrupt. <- data_train$Bankrupt. - 1
+#^Run once to allow SMOTE to run
+data_smote <- SMOTE(data_train, data_train$Bankrupt., K = 5, dup_size = 30)
+
+smote_data <- data_smote$data
+
+summary(smote_data$Bankrupt.)
+
+smote_data <- smote_data %>% select(-class)
+```
+
+```{r}
+
+#Oversampling with SMOTE Variants
+#Adaptive Neighbor SMOTE
+data_ANS <- ANS(data_train, data_train$Bankrupt., dupSize = 5)
+
+ANS_data <- data_ANS$data
+
+summary(ANS_data$Bankrupt.)
+
+#ADASYN
+data_ADASYN <- ADAS(data_train, data_train$Bankrupt., K = 5)
+
+ADASYN_data <- data_ADASYN$data
+
+summary(ADASYN_data$Bankrupt.)
+
+
+ADASYN_data <- ADASYN_data %>% select(-class)
+
+
+```
+
+
+
+```{r}
+#Seeing Probability Prediction Distribution
+summary(predicted_probabilities_test)
+hist(predicted_probabilities_test, breaks = 30, main = "Distribution of Predicted Probabilities",
+     xlab = "Predicted Probability", col = "lightblue", border = "black")
+```
+
+```{r}
+#Logistic Regression Model w/ Prediction Metrics
+set.seed(1286)
+duped_data$Bankrupt. <- as.factor(duped_data$Bankrupt.)
+
+log_model <- glm(formula, data = duped_data, family = binomial)
+
+
+predicted_probabilities_test <- predict(log_model, newdata = data_test, type = "response")
+
+
+threshold <- 0.53
+predicted_classes_test <- ifelse(predicted_probabilities_test > threshold, "1", "0")
+
+
+predicted_classes_test <- factor(predicted_classes_test, levels = levels(data_test$Bankrupt.))
+
+
+confusion_matrix_test <- confusionMatrix(predicted_classes_test, data_test$Bankrupt.)
+print(confusion_matrix_test)
+
+accuracy_test <- confusion_matrix_test$overall['Accuracy']
+print(paste("Accuracy on test set:", accuracy_test))
+
+
+roc_curve <- roc(data_test$Bankrupt., predicted_probabilities_test)
+plot(roc_curve, main = "ROC Curve for Logistic Regression Model", col = "blue", lwd = 2)
+
+auc_value <- auc(roc_curve)
+print(paste("AUC:", auc_value))
+
+f1_score <- F_meas(predicted_classes_test, data_test$Bankrupt.)
+print(paste("F1 Score:", f1_score))
+
+
+mcc_value <- mcc(preds = predicted_classes_test, actuals = data_test$Bankrupt.)
+print(paste("MCC:", mcc_value))
+
+```
+
+```{r}
+thresholds <- seq(0, 1, by = 0.01)
+youden_j_values <- numeric(length(thresholds))
+
+
+for (i in seq_along(thresholds)) {
+  threshold <- thresholds[i]
+  
+  predicted_classes_test <- ifelse(predicted_probabilities_test > threshold, "1", "0")
+  
+
+  predicted_classes_test <- factor(predicted_classes_test, levels = levels(data_test$Bankrupt.))
+  
+
+  confusion_matrix_test <- confusionMatrix(predicted_classes_test, data_test$Bankrupt.)
+  
+  sensitivity <- confusion_matrix_test$byClass["Sensitivity"]
+  specificity <- confusion_matrix_test$byClass["Specificity"]
+  youden_j_values[i] <- sensitivity + specificity - 1
+}
+
+
+max_j_index <- which.max(youden_j_values)
+optimal_threshold <- thresholds[max_j_index]
+max_youden_j <- youden_j_values[max_j_index]
+
+
+print(paste("Optimal Threshold:", optimal_threshold))
+print(paste("Maximum Youden's J:", max_youden_j))
+```
+
